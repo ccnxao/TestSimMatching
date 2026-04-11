@@ -2,6 +2,7 @@
 
 #include <cmath>
 #include <stdexcept>
+#include <utility>
 
 namespace sim {
 
@@ -33,6 +34,8 @@ MatchResult SimMatcher::run() {
     pull_new_orders();
 
     const auto& ticks = tick_source_.data();
+    result.fills.reserve(active_orders_.size());
+    result.terminal_orders.reserve(active_orders_.size());
     if (next_tick_index_ >= ticks.size()) {
         result.active_orders.assign(active_orders_.begin(), active_orders_.end());
         return result;
@@ -45,7 +48,7 @@ MatchResult SimMatcher::run() {
         // 这样即使中途生成了新的反向单，也要等下一笔 Tick 再参与撮合，避免同一 Tick 内无限连锁。
         std::size_t current_count = active_orders_.size();
         for (std::size_t i = 0; i < current_count; ++i) {
-            Order order = active_orders_.front();
+            Order order = std::move(active_orders_.front());
             active_orders_.pop_front();
 
             if (order.status != OrderStatus::Pending) {
@@ -66,11 +69,11 @@ MatchResult SimMatcher::run() {
                 order.fill_ts = fill.fill_ts;
                 order.accumulated_slippage = fill.accumulated_slippage;
                 order.pnl = fill.pnl;
-                result.terminal_orders.push_back(order);
+                result.terminal_orders.push_back(std::move(order));
 
                 if (fill.spawned_reverse_order.has_value()) {
-                    Order spawned = *fill.spawned_reverse_order;
-                    known_orders_[spawned.id] = 1;
+                    Order spawned = std::move(*fill.spawned_reverse_order);
+                    known_orders_.insert(spawned.id);
                     // 新生成的反向单进入活动队列，但不会在当前 Tick 立即撮合。
                     active_orders_.push_back(std::move(spawned));
                 }
@@ -103,8 +106,13 @@ MatchResult SimMatcher::run() {
 }
 
 void SimMatcher::pull_new_orders() {
-    for (Order order : order_queue_.get()) {
-        if (known_orders_.count(order.id) != 0) {
+    std::vector<Order> orders = order_queue_.get();
+    if (!orders.empty()) {
+        known_orders_.reserve(known_orders_.size() + orders.size());
+    }
+
+    for (Order& order : orders) {
+        if (known_orders_.find(order.id) != known_orders_.end()) {
             // 外部队列可能重复返回同一订单，这里直接去重。
             continue;
         }
@@ -116,8 +124,9 @@ void SimMatcher::pull_new_orders() {
         if (order.initial_price == 0.0) {
             order.initial_price = order.price;
         }
+        // 用户约定 target_profit 同时承担订单类型编码，入场时统一归一化一次。
         order.kind = infer_kind(order.target_profit);
-        known_orders_[order.id] = 1;
+        known_orders_.insert(order.id);
         active_orders_.push_back(std::move(order));
     }
 }
@@ -130,6 +139,7 @@ bool SimMatcher::try_fill(Order& order, const FuturesTick& tick, Fill& fill) {
     const Side side = order_side(order);
     const double order_price = order_abs_price(order);
     const double opponent = opponent_price(order, tick);
+    // 严格撮合：买单必须穿过 ask，卖单必须穿过 bid；等价不成交。
     const bool matched = side == Side::Buy ? (order_price > opponent) : (order_price < opponent);
     if (!matched) {
         return false;
@@ -152,6 +162,7 @@ bool SimMatcher::try_fill(Order& order, const FuturesTick& tick, Fill& fill) {
 }
 
 bool SimMatcher::should_expire_time(const Order& order, const FuturesTick& tick) const {
+    // 反向单必须成交，不允许被时间生命周期淘汰。
     if (order.kind == OrderKind::Reverse || order.time_to_live <= 0) {
         return false;
     }
@@ -160,6 +171,7 @@ bool SimMatcher::should_expire_time(const Order& order, const FuturesTick& tick)
 }
 
 bool SimMatcher::should_expire_space(const Order& order, const FuturesTick& tick) const {
+    // 反向单必须成交，不允许被空间生命周期淘汰。
     if (order.kind == OrderKind::Reverse || order.space_lifecycle_price <= 0.0) {
         return false;
     }
@@ -171,6 +183,7 @@ bool SimMatcher::should_expire_space(const Order& order, const FuturesTick& tick
 }
 
 bool SimMatcher::should_replace(const Order& order, const FuturesTick& tick) const {
+    // 正向单用 market_offset，反向单用 acceptable_risk 作为重委触发阈值。
     const double trigger_offset = order.kind == OrderKind::Reverse ? order.acceptable_risk
                                                                    : order.market_offset;
     if (trigger_offset <= 0.0 || order.kind == OrderKind::Normal) {
@@ -185,6 +198,7 @@ bool SimMatcher::should_replace(const Order& order, const FuturesTick& tick) con
 }
 
 void SimMatcher::replace_order(Order& order, const FuturesTick& tick) {
+    // 重委只改价格和次数，不改 submit_ts；反向单的报单时间仍沿用正向单。
     order.price = current_reprice(order, tick);
     ++order.replace_count;
 }
@@ -202,6 +216,7 @@ Order SimMatcher::spawn_reverse_order(const Order& filled_order, const Fill& fil
     reverse.initial_price = reverse.price;
     reverse.submit_ts = filled_order.submit_ts;
     reverse.fill_ts = 0;
+    // 按需求复用 time_to_live 存储正向单冲击成本；反向单不会用它做过期判断。
     reverse.time_to_live = fill.accumulated_slippage;
     reverse.space_lifecycle_price = 0.0;
     reverse.market_offset = filled_order.acceptable_risk;
@@ -228,6 +243,7 @@ Side SimMatcher::order_side(const Order& order) const {
 }
 
 double SimMatcher::opponent_price(const Order& order, const FuturesTick& tick) const {
+    // 买单对手盘是 ask，卖单对手盘是 bid。
     return order_side(order) == Side::Buy ? tick.ask_price : tick.bid_price;
 }
 
@@ -246,6 +262,7 @@ double SimMatcher::current_reprice(const Order& order, const FuturesTick& tick) 
 
 double SimMatcher::slippage(const Order& order, double fill_price) const {
     const double initial = std::abs(order.initial_price == 0.0 ? order.price : order.initial_price);
+    // 方向归一化后，正数代表更差成交，负数代表更优成交。
     return order_side(order) == Side::Buy ? (fill_price - initial) : (initial - fill_price);
 }
 

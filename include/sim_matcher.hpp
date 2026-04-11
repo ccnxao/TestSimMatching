@@ -2,10 +2,9 @@
 
 #include <cstdint>
 #include <deque>
-#include <memory>
 #include <optional>
 #include <string>
-#include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 namespace sim {
@@ -43,6 +42,7 @@ struct FuturesTick {
 
 struct Order {
     OrderId id {0};
+    // kind 会根据 target_profit 重新推导，保留该字段便于撮合结果直接表达订单类型。
     OrderKind kind {OrderKind::Normal};
     // 带方向的挂单价：> 0 买入，< 0 卖出，== 0 非法。
     double price {0.0};
@@ -56,7 +56,7 @@ struct Order {
     double time_to_live {0.0};
     // 空间生命周期阈值。反向单不按该字段过期。
     double space_lifecycle_price {0.0};
-    // 正向单市场偏移：对手盘到达报单价 +/- 该值后撤单重委。
+    // 正向单市场偏移：买单看 ask >= price + offset，卖单看 bid <= price - offset。
     double market_offset {0.0};
     // 最终成交价和最初报单价的方向归一价差，正数表示成交更差。
     double accumulated_slippage {0.0};
@@ -64,16 +64,16 @@ struct Order {
     double target_profit {0.0};
     // 反向单使用的市场偏移。正向单成交生成反向单时，反向单 market_offset 使用该值。
     double acceptable_risk {0.0};
-    // 正向单撤单重委时，对手盘 +/- 该值作为新报单价。
+    // 正向单撤单重委时，买单用 ask + offset，卖单用 bid - offset。
     double forward_reprice_offset {0.0};
-    // 反向单撤单重委时，对手盘 +/- 该值作为新报单价。
+    // 反向单撤单重委时，买单用 ask + offset，卖单用 bid - offset。
     double reverse_reprice_offset {0.0};
     OrderStatus status {OrderStatus::Pending};
     // 反向单会记录它是由哪张父单生成的。
     std::optional<OrderId> parent_order_id;
     // 反向单记录正向单成交价，用于计算组合盈亏。
     double parent_fill_price {0.0};
-    // 反向单成交时填写。买入正向单后卖出反向单：reverse - forward；卖出则相反。
+    // 反向单成交时填写。正向买入后卖出：reverse - forward；正向卖出后买入：forward - reverse。
     double pnl {0.0};
     // 仅统计被市场偏移触发的重挂次数。
     std::uint32_t replace_count {0};
@@ -145,8 +145,8 @@ private:
     IOrderQueue& order_queue_;
     // 当前仍然挂在系统里的订单。
     std::deque<Order> active_orders_;
-    // 用于去重，避免队列重复吐出同一订单时被重复入场。
-    std::unordered_map<OrderId, std::size_t> known_orders_;
+    // 只需要记录 id 是否出现过，set 比 map 少存一个无用 value，内存更小。
+    std::unordered_set<OrderId> known_orders_;
     // 正向单成交后，反向单 id 由撮合器内部生成。
     OrderId next_generated_order_id_ {1'000'000};
     // 增量消费 Tick，避免 run() 被重复调用时把老 Tick 重新撮合一遍。
