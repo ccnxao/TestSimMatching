@@ -1,7 +1,6 @@
 #pragma once
 
 #include <cstdint>
-#include <deque>
 #include <optional>
 #include <string>
 #include <unordered_set>
@@ -143,8 +142,10 @@ private:
 private:
     ITickSource& tick_source_;
     IOrderQueue& order_queue_;
-    // 当前仍然挂在系统里的订单。
-    std::deque<Order> active_orders_;
+    // 当前仍然挂在系统里的订单；vector 连续存储，适合每个 Tick 顺序扫描。
+    std::vector<Order> active_orders_;
+    // 每个 Tick 复用的下一轮活动订单缓冲，避免在撮合热路径里反复分配。
+    std::vector<Order> scratch_orders_;
     // 只需要记录 id 是否出现过，set 比 map 少存一个无用 value，内存更小。
     std::unordered_set<OrderId> known_orders_;
     // 正向单成交后，反向单 id 由撮合器内部生成。

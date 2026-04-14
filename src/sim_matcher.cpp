@@ -44,12 +44,13 @@ MatchResult SimMatcher::run() {
     for (std::size_t tick_index = next_tick_index_; tick_index < ticks.size(); ++tick_index) {
         const FuturesTick& tick = ticks[tick_index];
 
+        scratch_orders_.clear();
         // current_count 固定住这一轮要处理的订单数。
         // 这样即使中途生成了新的反向单，也要等下一笔 Tick 再参与撮合，避免同一 Tick 内无限连锁。
-        std::size_t current_count = active_orders_.size();
+        const std::size_t current_count = active_orders_.size();
+        scratch_orders_.reserve(current_count);
         for (std::size_t i = 0; i < current_count; ++i) {
-            Order order = std::move(active_orders_.front());
-            active_orders_.pop_front();
+            Order order = std::move(active_orders_[i]);
 
             if (order.status != OrderStatus::Pending) {
                 result.terminal_orders.push_back(std::move(order));
@@ -57,8 +58,8 @@ MatchResult SimMatcher::run() {
             }
 
             if (!tick_can_match_order(order, tick)) {
-                // Tick 还没到订单生效时间，说明这张单此刻还不存在。
-                active_orders_.push_back(std::move(order));
+                // 当前 Tick 早于订单报单时间，订单已入活动队列但尚未生效，暂不参与撮合。
+                scratch_orders_.push_back(std::move(order));
                 continue;
             }
 
@@ -75,7 +76,7 @@ MatchResult SimMatcher::run() {
                     Order spawned = std::move(*fill.spawned_reverse_order);
                     known_orders_.insert(spawned.id);
                     // 新生成的反向单进入活动队列，但不会在当前 Tick 立即撮合。
-                    active_orders_.push_back(std::move(spawned));
+                    scratch_orders_.push_back(std::move(spawned));
                 }
                 continue;
             }
@@ -96,8 +97,11 @@ MatchResult SimMatcher::run() {
                 replace_order(order, tick);
             }
 
-            active_orders_.push_back(std::move(order));
+            scratch_orders_.push_back(std::move(order));
         }
+
+        active_orders_.clear();
+        active_orders_.swap(scratch_orders_);
     }
 
     next_tick_index_ = ticks.size();
@@ -112,21 +116,22 @@ void SimMatcher::pull_new_orders() {
     }
 
     for (Order& order : orders) {
-        if (known_orders_.find(order.id) != known_orders_.end()) {
-            // 外部队列可能重复返回同一订单，这里直接去重。
-            continue;
-        }
-
         if (order.price == 0.0) {
             order.status = OrderStatus::Cancelled;
             continue;
         }
+
+        const auto insert_result = known_orders_.insert(order.id);
+        if (!insert_result.second) {
+            // 外部队列可能重复返回同一订单，这里直接去重。
+            continue;
+        }
+
         if (order.initial_price == 0.0) {
             order.initial_price = order.price;
         }
         // 用户约定 target_profit 同时承担订单类型编码，入场时统一归一化一次。
         order.kind = infer_kind(order.target_profit);
-        known_orders_.insert(order.id);
         active_orders_.push_back(std::move(order));
     }
 }
